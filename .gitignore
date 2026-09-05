@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+*.swp
+data/raw/*.jsonl
+!data/raw/.gitkeep
+!data/conformed/.gitkeep
+!data/curated/.gitkeep
+!data/quarantine/.gitkeep
+
+# Generated prototype datasets
+data/raw/**/*.jsonl
+data/conformed/**/*.parquet
+data/curated/**/*.parquet
+data/quarantine/**/*.jsonl
+data/loadtest/

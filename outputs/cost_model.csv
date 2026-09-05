@@ -1,0 +1,24 @@
+Category / Metric,Unit / Basis,Lean,Reference,High
+Annual Events,events/year,"14,012,000,000","14,012,000,000","14,012,000,000"
+Baseline Rate,events/sec,208.33,208.33,208.33
+Peak Season Rate,events/sec,1620.37,1620.37,1620.37
+40x Burst Rate,events/sec,8333.33,8333.33,8333.33
+1. Streaming / Kafka,USD/year,30000.00,52000.00,82000.00
+2. Stream Processing,USD/year,9388.80,23631.36,64688.64
+3. Object Storage / Lakehouse,USD/year,4350.00,11736.00,33720.00
+4. Monitoring / Logging,USD/year,5550.00,16680.00,71400.00
+5. Network / Egress,USD/year,4500.00,12000.00,30600.00
+6. Batch / Query Compute,USD/year,7290.00,22320.00,70080.00
+7. Orchestration,USD/year,4200.00,10200.00,19200.00
+8. Catalog / Governance,USD/year,3000.00,7800.00,16800.00
+9. Backup / Disaster Recovery,USD/year,3600.00,9000.00,21600.00
+10. Flash-Sale Elastic Burst,USD/year,680.64,2311.68,10241.28
+Modeled Subtotal,USD/year,72559.44,167679.04,420329.92
+Contingency Rate,percentage,8.0%,10.0%,12.0%
+Contingency Amount,USD/year,5804.76,16767.90,50439.59
+Total Annual Cost,USD/year,78364.20,184446.94,470769.51
+Monthly Run Rate,USD/month,6530.35,15370.58,39230.79
+Cost per 1M Events,USD/1M events,5.59,13.16,33.60
+Year-1 Budget Cap,USD,480000.00,480000.00,480000.00
+Budget Headroom,USD,401635.80,295553.06,9230.49
+Budget Consumed,percentage,16.3%,38.4%,98.1%

@@ -1,0 +1,140 @@
+# ==============================================================================
+# WBL Telemetry Platform: Parameterized Cost Model Assumptions
+#
+# NOTE ON VALUES:
+# - Workload sizing values (18M baseline/day, 140M peak/day, 61 peak days, 40x burst)
+#   are derived directly from the case study.
+# - Unit rates, worker capacities, Kafka platform placeholders, storage policies,
+#   and burst frequencies are explicit PLANNING ASSUMPTIONS, not vendor quotes
+#   or empirical production guarantees.
+# ==============================================================================
+
+year_1_budget_cap: 480000.0
+
+workload:
+  baseline_events_per_day: 18000000
+  baseline_days: 304              # January - October
+  peak_season_events_per_day: 140000000
+  peak_season_days: 61           # November - December (304 + 61 = 365)
+  instantaneous_burst_multiplier: 40.0 # 40x instantaneous baseline burst
+
+event_sizes_kb:
+  small: 0.5
+  reference: 1.0
+  large: 2.0
+  prototype_measured_avg: 0.218   # Empirical prototype observation (not production assumption)
+
+scenarios:
+  Lean:
+    description: "Cost-optimized architecture utilizing reserved/spot compute, aggressive storage lifecycle, and self-managed/basic services."
+    kafka:
+      base_monthly_platform: 2200.0       # Planning placeholder (e.g. 3-node reserved broker cluster)
+      seasonal_monthly_uplift: 1800.0     # November - December broker expansion
+    stream_processing:
+      worker_hourly_rate: 0.12            # $/worker-hour (spot / 1-yr reserved 2 vCPU)
+      baseline_workers: 3                 # Sustained capacity for 208 eps
+      peak_workers: 18                    # Sustained capacity for 1,620 eps
+      control_plane_monthly: 300.0        # Cluster management fee
+    storage:
+      average_stored_gb: 7500.0           # 90-day hot raw retention + compressed Parquet
+      rate_per_gb_month: 0.015            # Tiered object storage rate ($/GB-month)
+      dr_replication_multiplier: 1.0      # Single-region storage (no cross-region copy)
+      api_monthly_fees: 250.0             # Object PUT/GET/lifecycle requests
+    logging:
+      ingested_log_gb_month: 250.0        # Sampled error/audit logs
+      rate_per_gb_ingested: 0.25          # $/GB log ingestion (Loki/CloudWatch filtered)
+      platform_monthly_fee: 400.0         # Monitoring platform base
+    network:
+      egress_gb_month: 1500.0             # In-region IoT ingress & basic dashboard queries
+      rate_per_gb_egress: 0.05            # $/GB data transfer
+      nat_gateway_base_monthly: 300.0     # NAT Gateway base fee
+    query_compute:
+      active_hours_per_day: 4.0           # Serverless query runtime (Athena / DuckDB batch)
+      rate_per_compute_hour: 4.50         # $/hour compute rate
+      warehouse_storage_monthly: 60.0     # Query result staging buffer
+    fixed_services:
+      orchestration_monthly: 350.0        # Container-hosted workflow runner (e.g. Prefect/Airflow)
+      catalog_monthly: 250.0              # Serverless data catalog & schema registry
+      backup_dr_monthly: 300.0            # Automated snapshot backups
+    flash_sale_burst:
+      assumed_eps_per_worker: 500.0       # Planning assumption: worker core throughput
+      burst_duration_hours: 2.0           # Temporary surge window per event
+      bursts_per_month: 2                 # Planned marketing flash-sale campaigns/month
+      broker_burst_bandwidth_per_burst: 25.0 # Broker temporary bandwidth surcharge
+    contingency_percentage: 0.08          # 8% operational buffer for unexpected surges / backfills
+
+  Reference:
+    description: "Standard balanced enterprise cloud architecture using managed multi-AZ services, standard lifecycle, and dedicated support."
+    kafka:
+      base_monthly_platform: 3800.0       # Planning placeholder (e.g. 3-node managed multi-AZ Kafka)
+      seasonal_monthly_uplift: 3200.0     # November - December managed broker scaling
+    stream_processing:
+      worker_hourly_rate: 0.24            # $/worker-hour (on-demand 4 vCPU container)
+      baseline_workers: 4                 # Sustained capacity for 208 eps with N+1 redundancy
+      peak_workers: 20                    # Sustained capacity for 1,620 eps
+      control_plane_monthly: 800.0        # Managed Kubernetes / streaming control plane
+    storage:
+      average_stored_gb: 15000.0          # 180-day hot raw retention + Conformed & Curated Parquet
+      rate_per_gb_month: 0.021            # Standard cloud object storage ($/GB-month)
+      dr_replication_multiplier: 1.2      # Selective cross-region DR for Curated Parquet
+      api_monthly_fees: 600.0             # Object lifecycle & PUT/GET request fees
+    logging:
+      ingested_log_gb_month: 600.0        # Standard telemetry logs & APM metrics
+      rate_per_gb_ingested: 0.65          # $/GB managed logging ingestion
+      platform_monthly_fee: 1000.0        # Managed Grafana / logging platform
+    network:
+      egress_gb_month: 5000.0             # Cross-AZ traffic, IoT ingress, BI dashboard queries
+      rate_per_gb_egress: 0.08            # $/GB data transfer
+      nat_gateway_base_monthly: 600.0     # Multi-AZ NAT Gateway infrastructure
+    query_compute:
+      active_hours_per_day: 8.0           # Daily analytical transformations & BI queries
+      rate_per_compute_hour: 6.00         # $/hour (e.g. Small managed warehouse / Databricks SQL)
+      warehouse_storage_monthly: 400.0    # Warehouse caching and table metadata
+    fixed_services:
+      orchestration_monthly: 850.0        # Managed Airflow (e.g. MWAA small)
+      catalog_monthly: 650.0              # Managed Schema Registry & Data Catalog
+      backup_dr_monthly: 750.0            # Automated daily cross-region snapshots
+    flash_sale_burst:
+      assumed_eps_per_worker: 400.0       # Planning assumption: worker core throughput
+      burst_duration_hours: 2.0           # Temporary surge window per event
+      bursts_per_month: 4                 # Planned marketing flash-sale campaigns/month
+      broker_burst_bandwidth_per_burst: 40.0 # Broker temporary bandwidth surcharge
+    contingency_percentage: 0.10          # 10% operational buffer
+
+  High:
+    description: "Enterprise premium architecture with multi-region active replication, high retention, detailed APM logging, and dedicated compute."
+    kafka:
+      base_monthly_platform: 6000.0       # Planning placeholder (e.g. multi-AZ enterprise cluster)
+      seasonal_monthly_uplift: 5000.0     # November - December peak expansion
+    stream_processing:
+      worker_hourly_rate: 0.48            # $/worker-hour (dedicated enterprise streaming worker / Flink)
+      baseline_workers: 6                 # Baseline capacity with high redundancy
+      peak_workers: 28                    # Peak season dedicated fleet
+      control_plane_monthly: 2000.0       # Enterprise streaming control plane & support
+    storage:
+      average_stored_gb: 35000.0          # 365-day hot raw retention + multi-year conformed/curated
+      rate_per_gb_month: 0.023            # High-availability object storage ($/GB-month)
+      dr_replication_multiplier: 2.0      # Full multi-region active-active replication
+      api_monthly_fees: 1200.0            # High-frequency request fees and object versioning
+    logging:
+      ingested_log_gb_month: 1500.0       # Unsampled telemetry, APM traces, and security logs
+      rate_per_gb_ingested: 2.50          # $/GB enterprise APM ingestion (e.g. Datadog)
+      platform_monthly_fee: 2200.0        # Enterprise APM & observability license
+    network:
+      egress_gb_month: 15000.0            # Multi-region replication, high-volume BI egress
+      rate_per_gb_egress: 0.09            # $/GB data transfer
+      nat_gateway_base_monthly: 1200.0    # High-throughput NAT & inter-region transit
+    query_compute:
+      active_hours_per_day: 16.0          # High-concurrency BI analytics & near-real-time rollups
+      rate_per_compute_hour: 12.00        # $/hour (e.g. Medium managed warehouse)
+      warehouse_storage_monthly: 0.0      # Included in compute tier
+    fixed_services:
+      orchestration_monthly: 1600.0       # Enterprise managed Airflow with HA scheduler
+      catalog_monthly: 1400.0             # Enterprise data governance & lineage catalog
+      backup_dr_monthly: 1800.0           # Hot standby cross-region replication
+    flash_sale_burst:
+      assumed_eps_per_worker: 300.0       # Planning assumption: worker core throughput
+      burst_duration_hours: 3.0           # Temporary surge window per event
+      bursts_per_month: 8                 # Planned marketing flash-sale campaigns/month
+      broker_burst_bandwidth_per_burst: 75.0 # Broker temporary bandwidth surcharge
+    contingency_percentage: 0.12          # 12% operational buffer
