@@ -45,10 +45,12 @@ class ConformedPipeline:
         allowed_lateness_seconds: int = 15 * 60,
         max_future_skew_seconds: int = 12 * 60,
         dedup_retention_seconds: int = 30 * 60,
+        prune_interval_records: int = 1000,
     ) -> None:
         self.raw_dir = Path(raw_dir)
         self.conformed_dir = Path(conformed_dir)
         self.quarantine_dir = Path(quarantine_dir)
+        self.prune_interval_records = prune_interval_records
 
         self.validator = EventValidator(
             schema_path=schema_path, quarantine_dir=self.quarantine_dir
@@ -63,15 +65,20 @@ class ConformedPipeline:
         )
 
     def process_raw_files(
-        self, raw_file_pattern: Optional[str] = None
+        self,
+        raw_file_pattern: Optional[str] = None,
+        current_processing_time: Optional[datetime] = None,
     ) -> ProcessingMetrics:
         """Process all raw jsonl files matching pattern.
 
         Guarantees:
         - Raw data is never modified or deleted
         - Pipeline does not halt on malformed records
-        - Duplicates are filtered from Conformed
+        - Duplicates are filtered from Conformed within the deduplication retention window
+        - Expired deduplication state is pruned periodically to prevent memory growth
         - Late events are preserved and flagged with is_late=True
+        - Conformed Parquet writes provide replay-safe record/cardinality idempotency
+          (reprocessing does not double-count records; processed_at metadata updates)
         - Conformed Parquet files are written partitioned by processing_date
         """
         if raw_file_pattern is None:
@@ -85,7 +92,8 @@ class ConformedPipeline:
         )
 
         logger.info("Found %d raw files to process in %s", len(raw_files), self.raw_dir)
-        current_processing_time = datetime.now(timezone.utc)
+        if current_processing_time is None:
+            current_processing_time = datetime.now(timezone.utc)
 
         for raw_file in raw_files:
             logger.info("Processing raw file: %s", raw_file)
@@ -116,6 +124,13 @@ class ConformedPipeline:
                         # Raw keeps duplicates; Conformed keeps only first occurrence
                         continue
 
+                    # Periodic dedup state pruning to prevent unbounded in-memory growth
+                    if (
+                        self.prune_interval_records > 0
+                        and metrics.raw_count % self.prune_interval_records == 0
+                    ):
+                        self.deduplicator.prune_expired(current_time=current_processing_time)
+
                     # 3. Watermarking & Late-Event Handling Stage
                     is_late, _, watermark = self.watermark_tracker.process_event(
                         event_dict
@@ -129,6 +144,9 @@ class ConformedPipeline:
                         is_late=is_late,
                         processed_at=current_processing_time,
                     )
+
+        # Prune expired keys at batch completion
+        self.deduplicator.prune_expired(current_time=current_processing_time)
 
         # 5. Flush staged conformed events to partitioned Parquet
         metrics.unique_conformed_count = self.conformed_writer.flush()

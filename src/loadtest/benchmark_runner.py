@@ -51,6 +51,58 @@ class LatencySummary:
 
 
 @dataclass
+class SequenceReconciliation:
+    total_produced: int
+    total_observed: int
+    missing_count: int
+    duplicate_count: int
+    unexpected_count: int
+    missing_seqs_sample: List[int] = field(default_factory=list)
+    unexpected_seqs_sample: List[int] = field(default_factory=list)
+
+
+def reconcile_sequences(
+    total_produced: int,
+    observed_sequences: List[int],
+    sample_limit: int = 10,
+) -> SequenceReconciliation:
+    """Perform sequence-based reconciliation between produced range and observed sequences.
+
+    TrafficGenerator sequence numbers start at 1 and increment monotonically:
+        expected = set(range(1, total_produced + 1))
+
+    Calculates:
+    - missing_count: numbers in expected set but absent from observed
+    - duplicate_count: occurrences beyond the first for any sequence number
+    - unexpected_count: observed sequence numbers outside 1..total_produced
+    """
+    expected_set = set(range(1, total_produced + 1))
+    observed_set = set(observed_sequences)
+
+    missing_set = expected_set - observed_set
+    missing_count = len(missing_set)
+
+    unexpected_count = sum(1 for s in observed_sequences if s not in expected_set)
+    unexpected_set = observed_set - expected_set
+
+    # Total duplicates = total observed items - unique observed items
+    duplicate_count = len(observed_sequences) - len(observed_set)
+
+    missing_sample = sorted(list(missing_set))[:sample_limit]
+    unexpected_sample = sorted(list(unexpected_set))[:sample_limit]
+
+    return SequenceReconciliation(
+        total_produced=total_produced,
+        total_observed=len(observed_sequences),
+        missing_count=missing_count,
+        duplicate_count=duplicate_count,
+        unexpected_count=unexpected_count,
+        missing_seqs_sample=missing_sample,
+        unexpected_seqs_sample=unexpected_sample,
+    )
+
+
+@dataclass
 class BenchmarkRunResult:
     run_name: str
     num_consumers: int
@@ -63,6 +115,9 @@ class BenchmarkRunResult:
     max_processing_backlog: int
     max_commit_lag: int
     backlog_recovery_time_sec: float
+    duplicate_count: int = 0
+    unexpected_count: int = 0
+    reconciliation: Optional[SequenceReconciliation] = None
     latency: LatencySummary = field(default_factory=LatencySummary)
     lag_report: LagReport = field(default_factory=LagReport)
     worker_counts: Dict[int, int] = field(default_factory=dict)
@@ -197,14 +252,14 @@ class BenchmarkRunner:
 
         # 7. Aggregate Latencies and Throughput
         all_latencies: List[float] = []
-        all_seqs: Set[int] = set()
+        all_seqs: List[int] = []
         worker_counts: Dict[int, int] = {}
         first_recv_times = []
         last_recv_times = []
 
         for w in workers:
             all_latencies.extend(w.metrics.latencies_ms)
-            all_seqs.update(w.metrics.seq_numbers_seen)
+            all_seqs.extend(w.metrics.seq_numbers_seen)
             worker_counts[w.worker_id] = w.metrics.consumed_count
             if w.metrics.first_received_time:
                 first_recv_times.append(w.metrics.first_received_time)
@@ -212,7 +267,28 @@ class BenchmarkRunner:
                 last_recv_times.append(w.metrics.last_received_time)
 
         total_consumed = sum(worker_counts.values())
-        missing_count = max(0, producer_result.total_produced - total_consumed)
+
+        # Sequence-based message integrity reconciliation
+        reconciliation = reconcile_sequences(
+            total_produced=producer_result.total_produced,
+            observed_sequences=all_seqs,
+        )
+        missing_count = reconciliation.missing_count
+
+        logger.info(
+            "Reconciliation for %s: produced=%d, observed=%d, missing=%d, duplicates=%d, unexpected=%d",
+            run_name,
+            producer_result.total_produced,
+            reconciliation.total_observed,
+            reconciliation.missing_count,
+            reconciliation.duplicate_count,
+            reconciliation.unexpected_count,
+        )
+        if reconciliation.missing_count > 0:
+            logger.warning(
+                "Missing sequence numbers sample: %s",
+                reconciliation.missing_seqs_sample,
+            )
 
         # Calculate throughput over the exact active consumption window
         if first_recv_times and last_recv_times and max(last_recv_times) > min(first_recv_times):
@@ -244,6 +320,9 @@ class BenchmarkRunner:
             max_processing_backlog=lag_report.max_processing_backlog,
             max_commit_lag=lag_report.max_commit_lag,
             backlog_recovery_time_sec=lag_report.recovery_time_sec,
+            duplicate_count=reconciliation.duplicate_count,
+            unexpected_count=reconciliation.unexpected_count,
+            reconciliation=reconciliation,
             latency=latency_summary,
             lag_report=lag_report,
             worker_counts=worker_counts,

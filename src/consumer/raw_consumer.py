@@ -58,13 +58,14 @@ class RawTelemetryConsumer:
         group_id: str = "fleet-raw-consumer-group",
         raw_dir: Path = DEFAULT_RAW_DIR,
         auto_offset_reset: str = "earliest",
+        consumer: Optional[Consumer] = None,
     ) -> None:
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
         self.group_id = group_id
         self.writer = RawStorageWriter(raw_dir=raw_dir)
         self.auto_offset_reset = auto_offset_reset
-        self._consumer: Optional[Consumer] = None
+        self._consumer: Optional[Consumer] = consumer
         self.is_running = False
 
     def _init_consumer(self) -> Consumer:
@@ -72,15 +73,17 @@ class RawTelemetryConsumer:
             "bootstrap.servers": self.bootstrap_servers,
             "group.id": self.group_id,
             "auto.offset.reset": self.auto_offset_reset,
-            "enable.auto.commit": True,
-            "auto.commit.interval.ms": 1000,
+            "enable.auto.commit": False,  # Manual commit after successful persistence
         }
         consumer = Consumer(conf)
         consumer.subscribe([self.topic])
         return consumer
 
     def run(self, max_messages: int = 0, poll_timeout: float = 1.0) -> int:
-        """Start consumption loop.
+        """Start consumption loop with persist-before-commit delivery semantics.
+
+        Ordering:
+            poll -> persist raw payload -> successful write -> synchronous commit
 
         Args:
             max_messages: Stop after consuming this many messages (0 = run indefinitely).
@@ -89,10 +92,11 @@ class RawTelemetryConsumer:
         Returns:
             Number of raw messages successfully persisted.
         """
-        self._consumer = self._init_consumer()
+        if self._consumer is None:
+            self._consumer = self._init_consumer()
         self.is_running = True
         logger.info(
-            "Consumer started for topic '%s' (group: '%s', target: %s)",
+            "Consumer started for topic '%s' (group: '%s', target: %s, enable.auto.commit=False)",
             self.topic,
             self.group_id,
             self.writer.raw_dir,
@@ -112,9 +116,45 @@ class RawTelemetryConsumer:
                         logger.error("Kafka error: %s", msg.error())
                     continue
 
-                # Preserve raw string payload verbatim
-                raw_payload = msg.value().decode("utf-8")
-                self.writer.write_record(raw_payload)
+                # 1. Decode raw payload string verbatim
+                try:
+                    raw_payload = msg.value().decode("utf-8")
+                except Exception as e:
+                    logger.error(
+                        "Failed to decode message payload from %s [%d] at offset %d: %s",
+                        msg.topic(),
+                        msg.partition(),
+                        msg.offset(),
+                        e,
+                    )
+                    continue
+
+                # 2. Persist raw payload to storage first
+                try:
+                    self.writer.write_record(raw_payload)
+                except Exception as e:
+                    logger.error(
+                        "Failed to persist raw payload to storage: %s. Offset %d on %s [%d] will NOT be committed.",
+                        e,
+                        msg.offset(),
+                        msg.topic(),
+                        msg.partition(),
+                    )
+                    # Preserve at-least-once: do not commit offset on write failure
+                    continue
+
+                # 3. Synchronously commit Kafka offset ONLY after raw write succeeds
+                try:
+                    self._consumer.commit(message=msg, asynchronous=False)
+                except Exception as e:
+                    logger.error(
+                        "Failed to synchronously commit offset %d on %s [%d]: %s. "
+                        "Payload was persisted; redelivery may occur on rebalance/restart.",
+                        msg.offset(),
+                        msg.topic(),
+                        msg.partition(),
+                        e,
+                    )
 
                 consumed_count += 1
                 if consumed_count % 10 == 0:
@@ -136,5 +176,8 @@ class RawTelemetryConsumer:
         self.is_running = False
         if self._consumer is not None:
             logger.info("Closing Kafka consumer...")
-            self._consumer.close()
+            try:
+                self._consumer.close()
+            except Exception:
+                pass
             self._consumer = None

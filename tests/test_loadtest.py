@@ -8,7 +8,11 @@
 
 import pytest
 
-from src.loadtest.benchmark_runner import calculate_percentile
+from unittest.mock import MagicMock
+from confluent_kafka import ConsumerGroupTopicPartitions, TopicPartition
+
+from src.loadtest.benchmark_runner import calculate_percentile, reconcile_sequences
+from src.loadtest.lag_monitor import LagMonitor
 from src.loadtest.topic_manager import DEFAULT_LOADTEST_TOPIC, DEFAULT_PARTITIONS, TopicManager
 
 
@@ -74,25 +78,108 @@ def test_lag_calculation_logic():
 
 
 def test_reconciliation_logic():
-    """Verify detection of missing messages and duplicate deliveries."""
-    # Case 1: Perfect delivery
-    produced_seqs = set(range(1, 1001))
-    consumed_seqs = list(range(1, 1001))
-    missing = produced_seqs - set(consumed_seqs)
-    duplicates = len(consumed_seqs) - len(set(consumed_seqs))
-    assert len(missing) == 0
-    assert duplicates == 0
+    """Verify sequence-based message integrity reconciliation across edge cases."""
+    # 1. Perfect delivery -> 0 missing, 0 duplicate, 0 unexpected
+    produced = 1000
+    consumed_perfect = list(range(1, 1001))
+    res_perfect = reconcile_sequences(produced, consumed_perfect)
+    assert res_perfect.missing_count == 0
+    assert res_perfect.duplicate_count == 0
+    assert res_perfect.unexpected_count == 0
+    assert res_perfect.total_observed == 1000
 
-    # Case 2: Missing message
-    consumed_with_drop = list(range(1, 500)) + list(range(501, 1001))  # 500 dropped
-    missing_drop = produced_seqs - set(consumed_with_drop)
-    assert missing_drop == {500}
+    # 2. One missing message is detected
+    consumed_with_drop = list(range(1, 500)) + list(range(501, 1001))  # 500 missing
+    res_drop = reconcile_sequences(produced, consumed_with_drop)
+    assert res_drop.missing_count == 1
+    assert 500 in res_drop.missing_seqs_sample
+    assert res_drop.duplicate_count == 0
+    assert res_drop.total_observed == 999
 
-    # Case 3: Duplicate delivery
-    consumed_with_dup = list(range(1, 1001)) + [42, 42]  # duplicate deliveries
-    dup_count = len(consumed_with_dup) - len(set(consumed_with_dup))
-    assert dup_count == 2
-    assert len(produced_seqs - set(consumed_with_dup)) == 0
+    # 3. Duplicate delivery is detected even if total consumed count equals total produced
+    # Case: seq 500 missing, but seq 42 delivered twice -> total count is 1000!
+    # Naive produced - consumed would claim 0 missing; sequence reconciliation detects both!
+    consumed_cancelling = list(range(1, 500)) + list(range(501, 1001)) + [42]
+    assert len(consumed_cancelling) == produced  # 1000 consumed == 1000 produced
+    res_cancelling = reconcile_sequences(produced, consumed_cancelling)
+    assert res_cancelling.missing_count == 1, "Must detect the 1 missing sequence number"
+    assert res_cancelling.missing_seqs_sample == [500]
+    assert res_cancelling.duplicate_count == 1, "Must detect the 1 duplicate delivery"
+    assert res_cancelling.unexpected_count == 0
+
+    # 4. Multiple duplicates without drops
+    consumed_dups = list(range(1, 1001)) + [10, 20, 20]
+    res_dups = reconcile_sequences(produced, consumed_dups)
+    assert res_dups.missing_count == 0
+    assert res_dups.duplicate_count == 3
+    assert res_dups.total_observed == 1003
+
+    # 5. Unexpected / out-of-range sequence numbers
+    consumed_unexpected = list(range(1, 1001)) + [9999]
+    res_unexp = reconcile_sequences(produced, consumed_unexpected)
+    assert res_unexp.missing_count == 0
+    assert res_unexp.unexpected_count == 1
+    assert res_unexp.unexpected_seqs_sample == [9999]
+
+
+def test_lag_monitor_queries_real_group_and_handles_uncommitted():
+    """Verify LagMonitor queries committed offsets for the real worker group and handles -1001 safely."""
+    group_id = "real-benchmark-worker-group"
+    topic = "fleet.telemetry.loadtest"
+    num_partitions = 3
+
+    # Mock Worker
+    mock_worker = MagicMock()
+    mock_worker.get_positions.return_value = {0: 100, 1: 190, 2: 300}
+
+    # Mock Consumer for watermarks
+    mock_consumer = MagicMock()
+    # High watermarks for partitions 0, 1, 2
+    mock_consumer.get_watermark_offsets.side_effect = lambda tp, timeout: (0, {0: 100, 1: 200, 2: 350}[tp.partition])
+
+    # Mock AdminClient for committed offsets
+    mock_admin_client = MagicMock()
+    # Partition 0: 100 committed, Partition 1: 180 committed, Partition 2: -1001 (no commit yet)
+    tp0 = TopicPartition(topic, 0, 100)
+    tp1 = TopicPartition(topic, 1, 180)
+    tp2 = TopicPartition(topic, 2, -1001)
+
+    mock_cgtp = MagicMock()
+    mock_cgtp.topic_partitions = [tp0, tp1, tp2]
+    mock_future = MagicMock()
+    mock_future.result.return_value = mock_cgtp
+    mock_admin_client.list_consumer_group_offsets.return_value = {group_id: mock_future}
+
+    monitor = LagMonitor(
+        group_id=group_id,
+        workers=[mock_worker],
+        topic=topic,
+        num_partitions=num_partitions,
+        admin_client=mock_admin_client,
+        consumer=mock_consumer,
+    )
+
+    snapshot = monitor.sample_current_lag()
+
+    # 1. Verify AdminClient was queried with the REAL group_id
+    mock_admin_client.list_consumer_group_offsets.assert_called_once()
+    req_list = mock_admin_client.list_consumer_group_offsets.call_args[0][0]
+    assert req_list[0].group_id == group_id
+
+    # 2. Broker log ends: 100 + 200 + 350 = 650
+    assert snapshot.broker_log_end == 650
+
+    # 3. Consumer positions: 100 + 190 + 300 = 590
+    assert snapshot.consumer_position == 590
+
+    # 4. Processing backlog: (100-100) + (200-190) + (350-300) = 0 + 10 + 50 = 60
+    assert snapshot.processing_backlog == 60
+
+    # 5. Committed offsets: tp0=100, tp1=180, tp2=-1001 -> safely treated as 0! Total = 280
+    assert snapshot.committed_offset == 280
+
+    # 6. Commit lag: 650 - 280 = 370
+    assert snapshot.commit_lag == 370
 
 
 def test_topic_manager_defaults():

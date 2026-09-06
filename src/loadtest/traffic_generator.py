@@ -62,9 +62,10 @@ class TrafficGenerator:
 
         self.producer = Producer({
             "bootstrap.servers": self.bootstrap_servers,
-            "client.id": "fleet-loadtest-generator",
-            "acks": 1,  # Fast acknowledgement for load testing
-            "linger.ms": 5,
+            # acks=1 acknowledges as soon as the partition leader writes locally.
+            # Trade-off: Maximizes throughput for local single-node burst testing,
+            # but does NOT provide production-grade multi-broker durability (which requires acks="all").
+            "acks": 1,
             "batch.num.messages": 1000,
             "queue.buffering.max.messages": 200000,
             "queue.buffering.max.kbytes": 2097152,

@@ -386,3 +386,75 @@ def test_idempotent_re_run(tmp_path: Path):
         assert writer.get_count() == 2, "Conformed count must remain exactly 2 without duplication"
     finally:
         writer.close()
+
+
+def test_deduplicator_retention_pruning():
+    """Verify that expired deduplication state is pruned and old IDs become eligible again."""
+    from datetime import timedelta
+    from src.processor.deduplicator import EventDeduplicator
+
+    # 60-second retention window
+    dedup = EventDeduplicator(retention_seconds=60)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Register e1 at t0
+    is_dup1 = dedup.check_and_register("e1", seen_at=t0)
+    assert is_dup1 is False
+    assert dedup.count() == 1
+
+    # 2. Within retention window (+30s): e1 is duplicate; pruning does not remove it
+    t_30s = t0 + timedelta(seconds=30)
+    assert dedup.is_duplicate("e1") is True
+    pruned_30s = dedup.prune_expired(current_time=t_30s)
+    assert pruned_30s == 0
+    assert dedup.count() == 1
+
+    # 3. Beyond retention window (+65s): pruning removes e1
+    t_65s = t0 + timedelta(seconds=65)
+    pruned_65s = dedup.prune_expired(current_time=t_65s)
+    assert pruned_65s == 1
+    assert dedup.count() == 0
+
+    # 4. Old event_id e1 is now re-eligible according to defined retention policy
+    assert dedup.is_duplicate("e1") is False
+    is_dup_re_eligible = dedup.check_and_register("e1", seen_at=t_65s)
+    assert is_dup_re_eligible is False, "Expired event_id must become re-eligible for registration"
+    assert dedup.count() == 1
+
+
+def test_pipeline_integrates_deduplicator_pruning(tmp_path: Path):
+    """Verify that ConformedPipeline invokes deduplicator pruning during processing."""
+    from datetime import timedelta
+
+    raw_dir = tmp_path / "raw"
+    conformed_dir = tmp_path / "conformed"
+    quarantine_dir = tmp_path / "quarantine"
+    raw_dir.mkdir()
+
+    event1 = _create_sample_event(event_id="99999999-9999-9999-9999-000000000001")
+    event2 = _create_sample_event(event_id="99999999-9999-9999-9999-000000000002")
+
+    raw_file = raw_dir / "raw.jsonl"
+    with open(raw_file, "w", encoding="utf-8") as f:
+        f.write(json.dumps(event1) + "\n")
+        f.write(json.dumps(event2) + "\n")
+
+    # Pipeline configured with 10s retention and prune every 1 record
+    pipeline = ConformedPipeline(
+        raw_dir=raw_dir,
+        conformed_dir=conformed_dir,
+        quarantine_dir=quarantine_dir,
+        dedup_retention_seconds=10,
+        prune_interval_records=1,
+    )
+
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    metrics = pipeline.process_raw_files(current_processing_time=t0)
+    assert metrics.unique_conformed_count == 2
+    assert pipeline.deduplicator.count() == 2
+
+    # Advance time beyond 10s retention and prune
+    t_later = t0 + timedelta(seconds=15)
+    pruned = pipeline.deduplicator.prune_expired(current_time=t_later)
+    assert pruned == 2
+    assert pipeline.deduplicator.count() == 0

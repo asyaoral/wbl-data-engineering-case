@@ -14,7 +14,7 @@ Key Characteristics:
         - ingest_time: string
         - processed_at: string
 - Partitioned by event_date=YYYY-MM-DD for downstream analytics/BI query performance
-- Strict idempotency: re-running does not duplicate records
+- Replay-safe record/cardinality idempotency: re-running upserts on event_id primary key and does not double-count records
 """
 
 import logging

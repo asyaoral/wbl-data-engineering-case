@@ -16,7 +16,8 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
-from confluent_kafka import Consumer, TopicPartition
+from confluent_kafka import Consumer, ConsumerGroupTopicPartitions, TopicPartition
+from confluent_kafka.admin import AdminClient
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,8 @@ class LagMonitor(threading.Thread):
         num_partitions: int = DEFAULT_PARTITIONS,
         bootstrap_servers: str = DEFAULT_BOOTSTRAP_SERVERS,
         sample_interval_sec: float = 0.1,  # 100ms high-resolution sampling
+        admin_client: Optional[AdminClient] = None,
+        consumer: Optional[Consumer] = None,
     ) -> None:
         super().__init__(daemon=True, name="LagMonitor")
         self.group_id = group_id
@@ -68,7 +71,8 @@ class LagMonitor(threading.Thread):
 
         self._stop_requested = False
         self.samples: List[LagSnapshot] = []
-        self._admin_consumer: Optional[Consumer] = None
+        self._admin_consumer: Optional[Consumer] = consumer
+        self._admin_client: Optional[AdminClient] = admin_client
         self._lock = threading.Lock()
 
         self.burst_start_time: Optional[float] = None
@@ -78,15 +82,20 @@ class LagMonitor(threading.Thread):
     def _init_consumer(self) -> Consumer:
         conf = {
             "bootstrap.servers": self.bootstrap_servers,
-            "group.id": f"lag-query-{self.group_id}-{time.time()}",
+            "group.id": f"watermark-query-{self.group_id}-{time.time()}",
             "enable.auto.commit": False,
         }
         return Consumer(conf)
+
+    def _init_admin_client(self) -> AdminClient:
+        return AdminClient({"bootstrap.servers": self.bootstrap_servers})
 
     def sample_current_lag(self) -> LagSnapshot:
         """Query broker log end offsets, consumer positions, and committed offsets."""
         if self._admin_consumer is None:
             self._admin_consumer = self._init_consumer()
+        if self._admin_client is None:
+            self._admin_client = self._init_admin_client()
 
         tps = [TopicPartition(self.topic, p) for p in range(self.num_partitions)]
 
@@ -105,14 +114,19 @@ class LagMonitor(threading.Thread):
             for p, pos in w.get_positions().items():
                 consumer_positions[p] = max(consumer_positions.get(p, 0), pos)
 
-        # 3. Committed offsets
+        # 3. Committed offsets for the ACTUAL benchmark consumer group via AdminClient
         committed_offsets: Dict[int, int] = {}
-        try:
-            comm_list = self._admin_consumer.committed(tps, timeout=1.0)
-            for tp in comm_list:
-                committed_offsets[tp.partition] = tp.offset if tp.offset >= 0 else 0
-        except Exception:
-            pass
+        if self._admin_client is not None:
+            try:
+                req = [ConsumerGroupTopicPartitions(self.group_id, tps)]
+                fut_map = self._admin_client.list_consumer_group_offsets(req, request_timeout=1.0)
+                fut = fut_map.get(self.group_id)
+                if fut is not None:
+                    res = fut.result(timeout=1.0)
+                    for tp in res.topic_partitions:
+                        committed_offsets[tp.partition] = tp.offset if tp.offset >= 0 else 0
+            except Exception as e:
+                logger.debug("Could not query committed offsets for group '%s': %s", self.group_id, e)
 
         # Aggregate metrics
         total_broker_end = sum(broker_log_ends.values())
@@ -141,7 +155,10 @@ class LagMonitor(threading.Thread):
         )
 
     def run(self) -> None:
-        self._admin_consumer = self._init_consumer()
+        if self._admin_consumer is None:
+            self._admin_consumer = self._init_consumer()
+        if self._admin_client is None:
+            self._admin_client = self._init_admin_client()
         while not self._stop_requested:
             snapshot = self.sample_current_lag()
             with self._lock:

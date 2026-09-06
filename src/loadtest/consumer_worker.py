@@ -29,7 +29,7 @@ class WorkerMetrics:
     worker_id: int
     consumed_count: int = 0
     latencies_ms: List[float] = field(default_factory=list)
-    seq_numbers_seen: Set[int] = field(default_factory=set)
+    seq_numbers_seen: List[int] = field(default_factory=list)
     first_received_time: Optional[float] = None
     last_received_time: Optional[float] = None
     error_count: int = 0
@@ -133,7 +133,7 @@ class ConsumerWorker(threading.Thread):
                 try:
                     event_data = json.loads(payload_str)
                     if "seq_num" in event_data:
-                        self.metrics.seq_numbers_seen.add(event_data["seq_num"])
+                        self.metrics.seq_numbers_seen.append(event_data["seq_num"])
                 except Exception:
                     pass
 

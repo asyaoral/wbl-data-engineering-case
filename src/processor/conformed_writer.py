@@ -4,7 +4,10 @@ Requirements:
 - Store conformed telemetry records in Apache Parquet format
 - Partition by processing date (processing_date=YYYY-MM-DD), NOT by event time,
   to avoid scattered writes and small file fragmentation from late-arriving events
-- Idempotent writes: re-running on identical or overlapping records does not duplicate records
+- Replay-safe record/cardinality idempotency: re-running on identical or overlapping records
+  upserts by event_id primary key and does not double-count records. Metadata columns
+  (e.g. processed_at) reflect the latest processing run timestamp, so output provides
+  cardinality/business-key idempotency rather than byte-for-byte identical files.
 - Enforce uniqueness on primary key: event_id
 - Include metadata columns: is_late (boolean), processed_at (ISO timestamp), processing_date (partition)
 """

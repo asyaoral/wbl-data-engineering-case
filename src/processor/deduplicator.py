@@ -20,8 +20,14 @@ DEFAULT_RETENTION_SECONDS = 30 * 60  # 30 minutes (covers 15m lateness + buffer)
 class EventDeduplicator:
     """Stateful deduplicator tracking event_ids within a retention time window."""
 
-    def __init__(self, retention_seconds: int = DEFAULT_RETENTION_SECONDS) -> None:
+    def __init__(
+        self,
+        retention_seconds: int = DEFAULT_RETENTION_SECONDS,
+        auto_prune_interval: int = 0,
+    ) -> None:
         self.retention_window = timedelta(seconds=retention_seconds)
+        self.auto_prune_interval = auto_prune_interval
+        self._op_count = 0
         # Maps event_id -> arrival timestamp (for TTL cleanup)
         self._seen_events: Dict[str, datetime] = {}
 
@@ -44,6 +50,11 @@ class EventDeduplicator:
             True if event is a DUPLICATE (already seen)
             False if event is UNIQUE (newly registered)
         """
+        if self.auto_prune_interval > 0:
+            self._op_count += 1
+            if self._op_count % self.auto_prune_interval == 0:
+                self.prune_expired(seen_at)
+
         if self.is_duplicate(event_id):
             logger.debug("Duplicate event_id detected: %s", event_id)
             return True

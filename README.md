@@ -59,29 +59,32 @@ data/loadtest/run_a/*.jsonl    data/loadtest/run_b/*.jsonl
 
 ## Storage & Partitioning Layers
 
-| Layer | Format | Partition Scheme | Purpose |
+| Layer | Format | Partition Scheme | Purpose & Semantics |
 |---|---|---|---|
-| **Raw** | JSON Lines | Ingestion Date (`YYYY-MM-DD`) | Immutable landing zone preserving raw sensor payloads verbatim, including duplicates and malformed records. |
+| **Raw** | JSON Lines | Ingestion Date (`YYYY-MM-DD`) | Immutable landing zone preserving raw sensor payloads verbatim, including duplicates and malformed records. Persist-before-commit at-least-once delivery. |
 | **Quarantine** | JSON Lines | Quarantine Date (`YYYY-MM-DD`) | Isolated rejection zone preserving verbatim raw records with detailed schema rejection reasons. |
-| **Conformed** | Parquet (DuckDB) | `processing_date=YYYY-MM-DD` | Clean, deduplicated layer with late-event flags (`is_late`). Partitioned by processing date to avoid file fragmentation. |
-| **Curated** | Parquet (DuckDB) | `event_date=YYYY-MM-DD` | Analytics-ready BI layer partitioned by event date for optimal time-range query performance. |
+| **Conformed** | Parquet (DuckDB) | `processing_date=YYYY-MM-DD` | Clean, deduplicated layer with late-event flags (`is_late`). Partitioned by processing date to avoid small-file fragmentation. Provides **replay-safe record/cardinality idempotency** via primary key (`event_id`) upsert (reprocessing does not double-count records; `processed_at` metadata updates). |
+| **Curated** | Parquet (DuckDB) | `event_date=YYYY-MM-DD` | Analytics-ready BI layer partitioned by event date for optimal time-range query performance. Replay-safe record idempotency on `event_id`. |
 | **Load Test** | JSON Lines | Worker-isolated (`worker_{id}.jsonl`) | Isolated benchmark zone under `data/loadtest/` preventing concurrent write collisions. |
 
 ---
 
 ## Key Metrics & Domain Distinctions
 
-1. **Device Clock Skew**: Physical discrepancy between the onboard hardware clock and true UTC reference time (observed drift: -10.90 to +10.55 minutes).
-2. **Observed Arrival Offset (`ingest_time - event_time`)**: Conflates device clock skew with network transmission delay. True network latency cannot be isolated from the event schema alone without synchronized hardware clocks (e.g. GPS PPS).
-3. **Batch Reprocessing Delay / Age at Processing (`processed_at - ingest_time`)**: Measures historical elapsed duration between raw file landing and batch execution of the Conformed/Curated jobs (~49,000s). Represents dataset age at time of processing, **not** live streaming pipeline latency.
-4. **Kafka Publish-to-Consume Latency**: Real live latency measured in Milestone 4 within the same machine clock domain (`consumer_receive_time - kafka_message_timestamp`). Measures true queueing delay during burst backpressure (p50: ~11ms, p95: ~16ms, p99: ~18ms).
-5. **Consumer Lag & Backpressure**: Real-time difference between log end offset and committed offset across all 6 partitions (`sum(high_watermark - committed)`). Serves as prototype evidence of ingestion backpressure during traffic spikes.
+1. **Device Clock Skew**: Physical discrepancy between onboard hardware clocks and true UTC reference time (simulated drift: -10.90 to +10.55 minutes).
+2. **Watermark Allowed Lateness Trade-off**: The 15-minute allowed lateness window is an explicit operational trade-off balancing data completeness, finalization latency, and state retention cost. While individual device clocks drift up to ±11 minutes relative to UTC, theoretical worst-case relative device-to-device skew could reach ~22 minutes. A 15-minute window bounds in-memory deduplication state and prevents indefinite finalization delays. Out-of-watermark events are **never dropped**; they are flagged (`is_late=True`) and retained for auditability and replayable reprocessing.
+3. **Observed Arrival Offset (`ingest_time - event_time`)**: Conflates device clock skew with network transmission delay. True network latency cannot be isolated from the event schema alone without synchronized hardware clocks (e.g. GPS PPS).
+4. **Batch Reprocessing Delay / Age at Processing (`processed_at - ingest_time`)**: Measures historical elapsed duration between raw file landing and batch execution of the Conformed/Curated jobs (~49,000s). Represents dataset age at time of processing, **not** live streaming pipeline latency.
+5. **Kafka Publish-to-Consume Latency**: Live latency measured in Milestone 4 within the same machine clock domain (`consumer_receive_time - kafka_message_timestamp`). Measures queueing delay during burst backpressure (p50: ~11ms, p95: ~16ms, p99: ~18ms).
+6. **Processing Backlog vs. Commit Lag**: Real-time processing backlog (`broker log end - worker current position`) measures true unconsumed queue depth, whereas commit lag (`broker log end - group committed offset`) reflects offset persistence intervals.
 
 ---
 
 ## Quickstart & Operations
 
-### 1. Set Up Environment
+Follow this complete sequence from a fresh clone:
+
+### 1. Set Up Virtual Environment
 
 ```bash
 python3 -m venv .venv
@@ -89,68 +92,124 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Run All Automated Unit Tests
+### 2. Start Kafka Infrastructure
+
+```bash
+docker compose up -d
+```
+
+Verify broker is healthy:
+```bash
+docker compose ps
+```
+
+### 3. Ingest Telemetry to Raw Layer (Persist-Before-Commit)
+
+Start the raw consumer in one terminal or with `--max-messages`:
+```bash
+# Consumes from 'fleet.telemetry.raw' and persists verbatim to data/raw/
+python -m src.consumer.main --max-messages 50
+```
+
+In another terminal (with `.venv` activated), publish simulated telemetry:
+```bash
+# Produces 50 simulated events (including duplicates, schema variations, and clock drift)
+python -m src.producer.main --count 50
+```
+
+Confirm Raw data was persisted:
+```bash
+ls -lh data/raw/
+head -n 2 data/raw/*.jsonl
+```
+
+### 4. Run Raw → Conformed Processing (Milestone 2)
+
+Validates schema, routes invalid records to quarantine, deduplicates within retention window, tracks watermarks, and writes partitioned Parquet:
+```bash
+python -m src.processor.main
+```
+
+### 5. Build Curated Layer & Run BI Analytics (Milestone 3)
+
+Transforms conformed events into event-date partitioned Parquet and outputs BI analytics queries:
+```bash
+python -m src.curated.main
+```
+
+### 6. Run Live Kafka 40x Load & Burst Benchmark (Milestone 4)
+
+Executes isolated Run A (1 consumer) vs Run B (4 consumers) under a 40x burst profile:
+```bash
+python -m src.loadtest.main
+```
+
+### 7. Run Workload Sizing & Parameterized Cost Model (Milestone 5)
+
+Generates terminal cost breakdown and exports `outputs/cost_model.csv` and `outputs/cost_model.md`:
+```bash
+python -m src.cost.main
+```
+
+### 8. Run Full Automated Test Suite
 
 ```bash
 pytest -v tests/
 ```
 
-### 3. Run Pipeline Stages
+### 9. Clean Shutdown
 
 ```bash
-# Milestone 2: Process Raw to Conformed Parquet
-python -m src.processor.main
-
-# Milestone 3: Build Curated Parquet & Generate Metrics / BI Reports
-python -m src.curated.main
-
-# Milestone 4: Run Live Kafka 40x Load & Burst Benchmark (Run A vs Run B)
-python -m src.loadtest.main
-
-# Milestone 5: Workload Sizing & Parameterized Cost Model
-python -m src.cost.main
+docker compose down
 ```
 
 ---
 
 ## Milestone 4 Benchmark Results
 
+> [!NOTE]
+> **Scope & Environment**: The benchmark below measures local prototype behavior under the tested burst profile on a single development machine. It demonstrates single-node broker queueing, real group commit tracking via AdminClient, and consumer group partition sharing; it does **NOT** prove production durability or availability under broker, node, or regional cloud failures.
+
 | Metric | Run A (1 Consumer) | Run B (4 Consumers) |
 |---|---|---|
 | **Topic Partitions** | 6 | 6 |
 | **Active Consumer Workers** | 1 | 4 |
 | **Requested Baseline Rate** | 50 msg/s (15s) | 50 msg/s (15s) |
-| **Achieved Baseline Rate** | 50.0 msg/s | 50.0 msg/s |
+| **Achieved Baseline Rate** | 49.9 msg/s | 50.0 msg/s |
 | **Requested Burst Rate (40x)** | 2,000 msg/s (15s) | 2,000 msg/s (15s) |
-| **Achieved Burst Rate** | 1,999.9 msg/s | 1,999.4 msg/s |
-| **Total Events Produced** | 30,752 | 30,744 |
-| **Total Events Consumed** | 30,752 | 30,744 |
-| **Missing Events After Drain** | **0 (0.0% loss)** | **0 (0.0% loss)** |
-| **Consumer Throughput** | 1,025.9 msg/s | 1,026.5 msg/s |
-| **Peak Processing Backlog (Unconsumed)** | **0 msgs** | **0 msgs** |
-| **Peak Commit Lag (Offset Batching)** | 30,752 msgs | 30,744 msgs |
-| **Backlog Recovery Time (to 0 queue)** | **0.04s** | **0.09s** |
-| **Publish-to-Consume Latency (p50)** | 11.0 ms | 10.7 ms |
-| **Publish-to-Consume Latency (p95)** | 15.6 ms | 15.6 ms |
-| **Publish-to-Consume Latency (p99)** | 17.7 ms | 18.7 ms |
-| **Publish-to-Consume Latency (Max)** | 24.6 ms | 28.2 ms |
+| **Achieved Burst Rate** | 1,999.7 msg/s | 1,999.6 msg/s |
+| **Total Events Produced** | 30,817 | 30,776 |
+| **Total Events Consumed** | 30,817 | 30,776 |
+| **Missing Events (Sequence Reconciled)** | **0 (0.0% loss)** | **0 (0.0% loss)** |
+| **Duplicate Deliveries** | **0** | **0** |
+| **Consumer Throughput** | 1,027.5 msg/s | 1,026.8 msg/s |
+| **Peak Processing Backlog (Unconsumed)** | **12 msgs** | **0 msgs** |
+| **Peak Commit Lag (Offset Batching)** | 469 msgs | 506 msgs |
+| **Backlog Recovery Time (to 0 queue)** | **0.10s** | **0.09s** |
+| **Publish-to-Consume Latency (p50)** | 9.3 ms | 9.3 ms |
+| **Publish-to-Consume Latency (p95)** | 15.3 ms | 14.7 ms |
+| **Publish-to-Consume Latency (p99)** | 17.6 ms | 17.1 ms |
+| **Publish-to-Consume Latency (Max)** | 38.9 ms | 29.7 ms |
 
 ---
 
 ## Architectural Implications for Production
 
 1. **Processing Backlog vs. Commit Lag**:
-   - 'Commit lag' (log end offset - committed offset) reflects asynchronous batch commit persistence intervals, whereas 'processing backlog' (log end offset - consumer position) reflects true unconsumed queue depth. Real-time consumption keeps processing backlog at ~0 while commit lag progresses in background batches.
+   - 'Commit lag' (log end offset - committed offset of real group) reflects asynchronous batch commit persistence intervals, whereas 'processing backlog' (log end offset - consumer position) reflects true unconsumed queue depth. Real-time consumption keeps processing backlog at ~0 while commit lag progresses in periodic batches.
 2. **Scale-Out Observations on Local Prototype**:
    - On this local single-node environment, 1 consumer worker was already capable of consuming ~2,000 msg/s directly from Kafka with negligible backlog.
-   - Run B demonstrates that 4 workers in a consumer group cleanly divide the 6 partitions without contention, achieving zero message loss.
-   - Because the single consumer was not bottlenecked at 2,000 msg/s, overall throughput was producer-rate-bound. True scale-out throughput gains emerge when downstream processing (complex validation, analytical transforms, database writes) creates a CPU or I/O bottleneck exceeding single-worker capacity.
-3. **Live Latency vs. Simulated Clock Skew**:
-   - Observed local benchmark maximum latency was 24.6 ms for Run A and 28.2 ms for Run B; no business SLA was provided for comparison.
-   - Live Kafka publish-to-consume latency is small (~11-18ms), showing that broker transport adds minimal queueing delay under prototype burst conditions.
+   - Run B demonstrates that 4 workers in a consumer group cleanly divide the 6 partitions without contention.
+   - Because the single consumer was not bottlenecked at 2,000 msg/s on simple I/O, overall throughput was producer-rate-bound. True scale-out throughput gains emerge when downstream processing (complex validation, analytical transforms, database writes) creates a CPU or I/O bottleneck exceeding single-worker capacity.
+3. **Producer Durability vs. Throughput Trade-Off**:
+   - The load test traffic generator is configured with `acks=1` to maximize throughput for single-node burst testing. This is an intentional local benchmark optimization and does NOT prove multi-broker fault-tolerant zero-data-loss durability (which requires `acks="all"`, `min.insync.replicas=2`, and multi-node clusters in production).
+4. **Live Latency vs. Simulated Clock Skew**:
+   - Observed local benchmark maximum latency was 38.9 ms for Run A and 29.7 ms for Run B (p99: 17.6 ms / 17.1 ms); no business SLA was provided for comparison.
+   - Live Kafka publish-to-consume latency remained low (p50 ~9 ms, p99 ~17 ms) under the tested burst profile.
    - While this transport latency is orders of magnitude smaller than the ±11-minute timestamp differences observed in Milestones 1–3, that clock drift was synthetically injected by the prototype simulator and does NOT prove physical hardware behavior on real vehicles.
-4. **Backpressure and Zero Data Loss**:
-   - Kafka's partitioned append-only log smoothly absorbs instantaneous 40x surges without dropping records, ensuring 0 missing messages after drain in both runs.
+5. **Backpressure and Message Integrity**:
+   - In both tested local runs, sequence reconciliation found 0 missing messages after drain.
+   - This local benchmark does not imply that broker failure tolerance was tested, that exactly-once Kafka transport was proven, or that production capacity was validated.
 
 ---
 

@@ -6,14 +6,16 @@ Key Concepts:
     and true UTC reference time (observed up to ±11 minutes in prototype simulation).
   * Network Latency: Elapsed transit duration between event dispatch at the vehicle
     and arrival at the ingestion pipeline (ingest_time - dispatch_time).
-- Allowed Lateness Trade-off:
-  * Baseline assumption: allowed_lateness = 15 minutes (900 seconds).
-  * Justification: Accommodates up to ±11 minutes of known device clock drift plus
-    ~4 minutes of network transmission and queuing buffer.
-  * Trade-off consideration: Expanding this window (e.g. to 25 minutes) increases
-    pipeline completeness for extreme tail events, but requires holding deduplication
-    state and window buffers longer, increasing memory consumption, downstream latency,
-    and storage costs.
+- Allowed Lateness Engineering Trade-off:
+  * Baseline configuration: allowed_lateness = 15 minutes (900 seconds).
+  * Scope: Balances completeness against finalization latency and state retention cost.
+  * Note: While individual simulated device clocks drift up to ±11 minutes relative to UTC,
+    the theoretical worst-case relative device-to-device skew across two opposing devices
+    could reach up to ~22 minutes. A 15-minute window is an explicit operational trade-off:
+    expanding to 25+ minutes would increase in-memory deduplication state retention and
+    delay window finalization, whereas shortening it would increase late-event flags.
+  * Late events (event_time < watermark) are NEVER dropped; they are flagged with
+    is_late=True and preserved in storage for auditability and replayable reprocessing.
 - Future-Skew Protection:
   * A device with an erroneous or maliciously advanced clock could emit timestamps far
     into the future. If untracked, this would aggressively advance the watermark and
